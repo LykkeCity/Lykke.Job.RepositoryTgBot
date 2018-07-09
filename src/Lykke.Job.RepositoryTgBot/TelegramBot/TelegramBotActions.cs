@@ -1,4 +1,6 @@
-﻿using Lykke.Job.RepositoryTgBot.Settings.JobSettings;
+﻿using Common;
+using Common.Log;
+using Lykke.Job.RepositoryTgBot.Settings.JobSettings;
 using Octokit;
 using System;
 using System.Collections.Generic;
@@ -16,9 +18,19 @@ namespace Lykke.Job.RepositoryTgBot.TelegramBot
         public string RepoName { get; set; }
         public string Description { get; set; }
         public bool AddSecurityTeam { get; set; }
-        public bool AddCoreTeam { get; set; } 
+        public bool AddCoreTeam { get; set; }
+        public string MenuAction { get; set; }
     }
 
+    public class BranchProtectionRequiredReviewsUpdateExtention : BranchProtectionRequiredReviewsUpdate
+    {
+        public int RequiredApprovingReviewCount { get; set; }
+
+        public BranchProtectionRequiredReviewsUpdateExtention(BranchProtectionRequiredReviewsDismissalRestrictionsUpdate dismissalRestrictions, bool dismissStaleReviews, bool requireCodeOwnerReviews, int _requiredApprovingReviewCount) : base(dismissalRestrictions, dismissStaleReviews, requireCodeOwnerReviews)
+        {
+            RequiredApprovingReviewCount = _requiredApprovingReviewCount;
+        }
+    }
 
     public class TelegramBotActions
     {
@@ -36,55 +48,77 @@ namespace Lykke.Job.RepositoryTgBot.TelegramBot
 
         public async Task<List<Team>> GetTeamsAsync()
         {
-            var teams = await client.Organization.Team.GetAll(_organisation);
-
-            var teamsList = new List<Team>();
-
-            foreach (var team in teams)
+            try
             {
-                if (team.Name != _devTeam)
-                {
-                    teamsList.Add(team);
-                }
+                // await TelegramBotService._log.WriteInfoAsync("TelegramBotActions.GetTeamsAsync", "Get teams async", "");
 
+                var teams = await client.Organization.Team.GetAll(_organisation);
+
+                var teamsList = new List<Team>();
+
+                foreach (var team in teams)
+                {
+                    if (team.Name != _devTeam)
+                    {
+                        teamsList.Add(team);
+                    }
+                }
+                return teamsList;
             }
-            return teamsList;
+            catch (Exception ex)
+            {
+                await TelegramBotService._log.WriteErrorAsync("TelegramBotActions.GetTeamsAsync", "", ex);
+                throw;
+            }
         }
 
         public async Task<bool> RepositoryIsExist(string RepoName)
         {
             try
             {
+                await TelegramBotService._log.WriteInfoAsync("TelegramBotActions.RepositoryIsExist", "Check if repository exists", RepoName);
+
                 var repo = await client.Repository.Get(_organisation, RepoName);
 
                 return (repo != null);
             }
             catch (Exception e)
             {
+                await TelegramBotService._log.WriteErrorAsync("TelegramBotActions.RepositoryIsExist", RepoName, e);
                 return false;
             }
         }
 
         public async Task<List<Team>> UserHasTeamCheckAsync(string nickName)
         {
-            var teams = await client.Organization.Team.GetAll(_organisation);
-
-            var listTeams = new List<Team>();
-
-            foreach (var team in teams)
+            try
             {
-                if(team.Name != _devTeam)
+                await TelegramBotService._log.WriteInfoAsync("TelegramBotActions.UserHasTeamCheckAsync", "Check if user has team", nickName);
+
+                var teams = await client.Organization.Team.GetAll(_organisation);
+
+                var listTeams = new List<Team>();
+
+                foreach (var team in teams)
                 {
-                    var teamCheck = await TeamMemberCheckAsync(nickName, team);
-
-                    if (teamCheck)
+                    if (team.Name != _devTeam)
                     {
-                        listTeams.Add(team);
-                    }
-                }                 
-            }
+                        var teamCheck = await TeamMemberCheckAsync(nickName, team);
 
-            return listTeams;
+                        if (teamCheck)
+                        {
+                            listTeams.Add(team);
+                        }
+                    }
+                }
+
+                return listTeams;
+            }
+            catch (Exception ex)
+            {
+                await TelegramBotService._log.WriteErrorAsync("TelegramBotActions.UserHasTeamCheckAsync", nickName, ex);
+                throw;
+            }
         }
 
         public async Task<bool> OrgMemberCheckAsync(string nickName)
@@ -93,16 +127,82 @@ namespace Lykke.Job.RepositoryTgBot.TelegramBot
             return inOrganisation;
         }
 
-        public async Task<TelegramBotActionResult> CreateRepo(RepoToCreate repoToCreate)
+        public async Task<TelegramBotActionResult> CreateLibraryRepo(RepoToCreate repoToCreate)
         {
             try
             {
+                await TelegramBotService._log.WriteInfoAsync("TelegramBotActions.CreateLibraryRepo", "Create library repository", repoToCreate.ToJson());
+
                 var team = await client.Organization.Team.Get(repoToCreate.TeamId);
                 var teamName = team.Name.ToLower().Replace(' ', '-');
 
                 var codeOwnersFile = (team != null) ? $"* @{_organisation}/{teamName} " : "* ";
                 var commonDevelopersTeam = await GetTeamByName(RepositoryTgBotJobSettings.CommonDevelopersTeam);
-                
+
+                var message = $"Library repository \"{repoToCreate.RepoName}\" successfully created.";
+                // Creating new repo
+                var newRepo = new NewRepository(repoToCreate.RepoName) { AutoInit = true, Description = repoToCreate.Description };
+
+                var repositoryToEdit = await client.Repository.Create(_organisation, newRepo);
+
+                await client.Organization.Team.AddRepository(commonDevelopersTeam.Id, _organisation, repositoryToEdit.Name, new RepositoryPermissionRequest(Permission.Push));
+
+                var branchTeams = new BranchProtectionTeamCollection();
+
+                if (team != null)
+                {
+                    branchTeams.Add(teamName);
+                    message += $"\n Teams: \n \"{team.Name}\"";
+                }
+
+                var architectureTeam = RepositoryTgBotJobSettings.ArchitectureTeam.ToLower().Replace(' ', '-');
+                branchTeams.Add(architectureTeam);
+                codeOwnersFile += $"@{_organisation}/{architectureTeam} ";
+                message += $"\n \"{RepositoryTgBotJobSettings.ArchitectureTeam}\"";
+
+                //creating Code Owners file
+                await client.Repository.Content.CreateFile(repositoryToEdit.Id, "CODEOWNERS", new CreateFileRequest("Added CODEOWNERS file", codeOwnersFile));
+
+                var protSett = new BranchProtectionSettingsUpdate(null, new BranchProtectionRequiredReviewsUpdateExtention(new BranchProtectionRequiredReviewsDismissalRestrictionsUpdate(false), true, true, 2), new BranchProtectionPushRestrictionsUpdate(branchTeams), true);
+
+                //this method throws null reference ecxeption because responce
+                try
+                {
+                    await client.Connection.Put<BranchProtectionSettingsUpdate>(ApiUrls.RepoBranchProtection(repositoryToEdit.Id, "master"), protSett, null, "application/vnd.github.luke-cage-preview+json");
+
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine(e);
+                }
+
+                var link = repositoryToEdit.CloneUrl;
+
+                message += "\n Clone url: " + link;
+
+
+                return new TelegramBotActionResult { Success = true, Message = message };
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(ex);
+                await TelegramBotService._log.WriteErrorAsync("TelegramBotActions.CreateLibraryRepo", repoToCreate.ToJson(), ex);
+                return new TelegramBotActionResult { Success = false, Message = ex.Message };
+            }
+        }
+
+        public async Task<TelegramBotActionResult> CreateRepo(RepoToCreate repoToCreate)
+        {
+            try
+            {
+                await TelegramBotService._log.WriteInfoAsync("TelegramBotActions.CreateRepo", "Create repository", repoToCreate.ToJson());
+
+                var team = await client.Organization.Team.Get(repoToCreate.TeamId);
+                var teamName = team.Name.ToLower().Replace(' ', '-');
+
+                var codeOwnersFile = (team != null) ? $"* @{_organisation}/{teamName} " : "* ";
+                var commonDevelopersTeam = await GetTeamByName(RepositoryTgBotJobSettings.CommonDevelopersTeam);
+
                 var message = $"Repository \"{repoToCreate.RepoName}\" successfully created.";
                 //Creating new repo
                 var newRepo = new NewRepository(repoToCreate.RepoName) { AutoInit = true, TeamId = commonDevelopersTeam.Id, Description = repoToCreate.Description };
@@ -143,7 +243,7 @@ namespace Lykke.Job.RepositoryTgBot.TelegramBot
 
                 //Permitions to "test" branch
                 var masterProtSett = new BranchProtectionSettingsUpdate(new BranchProtectionPushRestrictionsUpdate(new BranchProtectionTeamCollection(new List<string>() { teamName })));
-                var testProtSett = new BranchProtectionSettingsUpdate(null, new BranchProtectionRequiredReviewsUpdate(new BranchProtectionRequiredReviewsDismissalRestrictionsUpdate(false), true, true), new BranchProtectionPushRestrictionsUpdate(branchTeams), true);                
+                var testProtSett = new BranchProtectionSettingsUpdate(null, new BranchProtectionRequiredReviewsUpdate(new BranchProtectionRequiredReviewsDismissalRestrictionsUpdate(false), true, true), new BranchProtectionPushRestrictionsUpdate(branchTeams), true);
                 await client.Repository.Branch.UpdateBranchProtection(repositoryToEdit.Id, "test", testProtSett);
                 await client.Repository.Branch.UpdateBranchProtection(repositoryToEdit.Id, "master", masterProtSett);
 
@@ -154,6 +254,7 @@ namespace Lykke.Job.RepositoryTgBot.TelegramBot
             }
             catch (Exception ex)
             {
+                await TelegramBotService._log.WriteErrorAsync("TelegramBotActions.CreateRepo", repoToCreate.ToJson(), ex);
                 return new TelegramBotActionResult { Success = false, Message = ex.Message };
             }
 
@@ -167,22 +268,33 @@ namespace Lykke.Job.RepositoryTgBot.TelegramBot
         /// <returns> </returns>
         public async Task<TelegramBotActionResult> AddUserInTeam(string nickName, int teamId)
         {
-            var team = await client.Organization.Team.Get(teamId);
+            var data = new { nickName, teamId }.ToJson();
+            try
+            {
+                await TelegramBotService._log.WriteInfoAsync("TelegramBotActions.AddUserInTeam", "Add user in team", data);
 
-            if (team == null)
-                //return success false with message
-                return new TelegramBotActionResult { Success = false, Message = $"There are such no teams." };
+                var team = await client.Organization.Team.Get(teamId);
 
-            var userInTeam = await TeamMemberCheckAsync(nickName, team);
+                if (team == null)
+                    //return success false with message
+                    return new TelegramBotActionResult { Success = false, Message = $"There are such no teams." };
 
-            if (userInTeam)
-                //return success false with message
-                return new TelegramBotActionResult { Success = true, Message = $"User {nickName} alrady in team: {team.Name}." };
+                var userInTeam = await TeamMemberCheckAsync(nickName, team);
 
-            await client.Organization.Team.AddOrEditMembership(team.Id, nickName, new UpdateTeamMembership(TeamRole.Member));
+                if (userInTeam)
+                    //return success false with message
+                    return new TelegramBotActionResult { Success = true, Message = $"User {nickName} alrady in team: {team.Name}." };
 
-            //return success true with message
-            return new TelegramBotActionResult { Success = true, Message = $"User {nickName} added in team {team.Name} as a member." };
+                await client.Organization.Team.AddOrEditMembership(team.Id, nickName, new UpdateTeamMembership(TeamRole.Member));
+
+                //return success true with message
+                return new TelegramBotActionResult { Success = true, Message = $"User {nickName} added in team {team.Name} as a member." };
+            }
+            catch (Exception ex)
+            {
+                await TelegramBotService._log.WriteErrorAsync("TelegramBotActions.AddUserInTeam", data, ex);
+                return new TelegramBotActionResult { Success = false, Message = ex.Message };
+            }
         }
 
         public async Task<string> GetTeamById(int teamId)
